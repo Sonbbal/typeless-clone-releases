@@ -22,12 +22,18 @@ concurrency:
 jobs:
   release:
     runs-on: macos-14
+    # job 수준 env·runs-on 에서는 runner 컨텍스트를 쓸 수 없다(쓰면 워크플로 전체가 무효).
+    # 러너 임시 경로는 첫 단계가 $RUNNER_TEMP 로 계산해 $GITHUB_ENV 로 뒤 단계에 넘긴다.
     env:
       TAG: ${{ github.ref_name }}
-      RELEASE_KEYCHAIN: ${{ runner.temp }}/release-signing.keychain-db
-      CERT_FILE: ${{ runner.temp }}/release-signing/cert.p12
-      RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs
     steps:
+      - name: Set runner paths
+        run: |
+          {
+            echo "RELEASE_KEYCHAIN=$RUNNER_TEMP/release-signing.keychain-db"
+            echo "CERT_FILE=$RUNNER_TEMP/release-signing/cert.p12"
+            echo "RELEASE_LOG_DIR=$RUNNER_TEMP/release-logs"
+          } >> "$GITHUB_ENV"
       - name: Validate tag name
         run: |
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
