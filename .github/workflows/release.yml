@@ -1,0 +1,152 @@
+# 공개 저장소(Sonbbal/typeless-clone-releases): private 워크플로가 push 한 v* 태그 →
+# 같은 태그의 private 소스를 받아 헬퍼 빌드·패키징·서명 → 점검 → zip·latest.json → 같은 태그 릴리즈.
+# 이 저장소의 실행 로그는 누구나 읽는다: set -x 금지, 소스 본문·비밀값 출력 금지.
+# private 소스를 다루는 단계(설치·빌드·점검·manifest·산출물 테스트)의 출력은 러너 임시 파일로만 보내고
+# 로그에는 단계 이름과 PASS/FAIL·exit code 한 줄만 남긴다 — 컴파일러·테스트의 code frame 이 공개되지 않게.
+# 실패는 exit code 를 그대로 돌려주므로 뒤 단계(게시)는 돌지 않는다.
+# 비밀값은 run 문자열이 아니라 env 로만, 쓰는 단계에만 넘긴다(npm 스크립트가 GITHUB_TOKEN 을 보지 않게). 원본은 typeless-clone 의 release/public-repo/ 에 있다.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      TAG: ${{ github.ref_name }}
+      RELEASE_KEYCHAIN: ${{ runner.temp }}/release-signing.keychain-db
+      CERT_FILE: ${{ runner.temp }}/release-signing/cert.p12
+      RELEASE_LOG_DIR: ${{ runner.temp }}/release-logs
+    steps:
+      - name: Validate tag name
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag is not v<semver>"
+            exit 1
+          fi
+      - name: Check existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::release for tag already exists; skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout private source
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Sonbbal/typeless-clone
+          ref: ${{ github.ref_name }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Setup Node
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          mkdir -p "$RELEASE_LOG_DIR"
+          if npm ci > "$RELEASE_LOG_DIR/npm-ci.log" 2>&1; then
+            echo "npm ci: PASS"
+          else
+            code=$?
+            echo "::error::npm ci: FAIL (exit $code; output kept off the public log)"
+            exit "$code"
+          fi
+      - name: Import signing certificate
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/release-signing"
+          printf '%s' "$MAC_CERT_P12_BASE64" | base64 --decode > "$CERT_FILE"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$RELEASE_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN"
+          security import "$CERT_FILE" -k "$RELEASE_KEYCHAIN" -P "$MAC_CERT_PASSWORD" -f pkcs12 -T /usr/bin/codesign > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$RELEASE_KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$RELEASE_KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$CERT_FILE"
+      - name: Package release
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          mkdir -p "$RELEASE_LOG_DIR"
+          if npm run package:release > "$RELEASE_LOG_DIR/package-release.log" 2>&1; then
+            echo "package:release: PASS"
+          else
+            code=$?
+            echo "::error::package:release: FAIL (exit $code; output kept off the public log)"
+            exit "$code"
+          fi
+      - name: Check package (release mode)
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          mkdir -p "$RELEASE_LOG_DIR"
+          if npm run check:package -- --mode release > "$RELEASE_LOG_DIR/check-package.log" 2>&1; then
+            echo "check:package --mode release: PASS"
+          else
+            code=$?
+            echo "::error::check:package --mode release: FAIL (exit $code; output kept off the public log)"
+            exit "$code"
+          fi
+      - name: Write latest.json
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          mkdir -p "$RELEASE_LOG_DIR"
+          if npm run release:manifest -- --tag "$TAG" --zip "dist/release/TypelessMVP-${TAG#v}-mac-arm64.zip" > "$RELEASE_LOG_DIR/release-manifest.log" 2>&1; then
+            echo "release:manifest: PASS"
+          else
+            code=$?
+            echo "::error::release:manifest: FAIL (exit $code; output kept off the public log)"
+            exit "$code"
+          fi
+      - name: Test release artifact
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          RELEASE_DIR: dist/release
+        run: |
+          mkdir -p "$RELEASE_LOG_DIR"
+          if npm run test:release-artifact > "$RELEASE_LOG_DIR/test-release-artifact.log" 2>&1; then
+            echo "test:release-artifact: PASS"
+          else
+            code=$?
+            echo "::error::test:release-artifact: FAIL (exit $code; output kept off the public log)"
+            exit "$code"
+          fi
+      - name: Publish release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease=""
+          if [[ "$TAG" == *-* ]]; then
+            prerelease="--prerelease"
+          fi
+          gh release create "$TAG" --repo ${{ github.repository }} --verify-tag --title "TypelessMVP $TAG" --notes "TypelessMVP $TAG (macOS Apple Silicon)" $prerelease "dist/release/TypelessMVP-${TAG#v}-mac-arm64.zip" "dist/release/latest.json"
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RELEASE_KEYCHAIN" 2> /dev/null || true
+          rm -rf "$RUNNER_TEMP/release-signing" "$RELEASE_LOG_DIR"
